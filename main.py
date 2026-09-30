@@ -1,9 +1,8 @@
 """
-GOLD (XAUUSDT) 1m/5m SMC + ICT Scalping Bot - Railway uchun tayyor
+GOLD (XAUUSDT) 1/5/15/30m SMC + ICT Scalping Bot - Railway uchun tayyor
 Yangilanishlar:
-  1. 1m va 5m taymfreymlariga to'liq o'tkazilgan (Kichik TF scalping).
-  2. RR (Risk/Reward) va SL masofalari scalping dinamikasiga moslashtirilgan.
-  3. Har 1 soniyada Bybit narxlarini tekshiradi.
+  1. 1, 5, 15 va 30 daqiqalik taymfreymlar to'liq sinxronlashtirildi.
+  2. Faqat barcha 4 ta taymfreym bir xil trendni ko'rsatsagina savdoga kiradi.
 """
 
 import datetime
@@ -137,6 +136,8 @@ last_status = {
     "price": None,
     "bias1": None,
     "bias5": None,
+    "bias15": None,
+    "bias30": None,
     "bias1h": None,
     "bias4h": None,
     "bias1d": None,
@@ -214,7 +215,7 @@ def _atomic_write(path, data):
 def save_log(log):
     _atomic_write(LOG_FILE, log)
 
-def save_status(price, bias1, bias5, bias1h=None, bias4h=None, bias1d=None):
+def save_status(price, bias1, bias5, bias15, bias30, bias1h=None, bias4h=None, bias1d=None):
     with state_lock:
         trade_snapshot = current_trade
     _atomic_write(
@@ -225,6 +226,8 @@ def save_status(price, bias1, bias5, bias1h=None, bias4h=None, bias1d=None):
             "lastCheckedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "bias1m": bias1,
             "bias5m": bias5,
+            "bias15m": bias15,
+            "bias30m": bias30,
             "bias1h": bias1h,
             "bias4h": bias4h,
             "bias1d": bias1d,
@@ -507,8 +510,9 @@ def build_signal_status_text():
     lines = [
         f"Holat: {'⏸ PAUZADA' if paused else '▶️ Ishlamoqda'}",
         f"Tekshiruv: {last_status['checked_at']} | Narx: {round(last_status['price'], 2)}",
-        f"1m bias: {last_status['bias1'] or 'n/a'} | 5m bias: {last_status['bias5'] or 'n/a'}",
-        f"1h bias: {last_status.get('bias1h') or 'n/a'} | 4h bias: {last_status.get('bias4h') or 'n/a'}",
+        f"1m: {last_status['bias1'] or 'n/a'} | 5m: {last_status['bias5'] or 'n/a'}",
+        f"15m: {last_status['bias15'] or 'n/a'} | 30m: {last_status['bias30'] or 'n/a'}",
+        f"1h: {last_status.get('bias1h') or 'n/a'} | 4h: {last_status.get('bias4h') or 'n/a'}",
     ]
     if current_trade:
         age_text = _trade_age_text(current_trade.get("opened_at"))
@@ -567,7 +571,7 @@ def telegram_listener():
                         with state_lock:
                             SUBSCRIBERS.add(chat_id)
                             save_subscribers()
-                        send_telegram("✅ Obuna bo'ldingiz! (1m/5m Scalping)", with_keyboard=True, chat_id=chat_id)
+                        send_telegram("✅ Obuna bo'ldingiz! (1/5/15/30m Scalping)", with_keyboard=True, chat_id=chat_id)
                     elif text in ("/signal", "📊 Signal"):
                         send_telegram(build_signal_status_text(), with_keyboard=True, chat_id=chat_id)
                     elif text == "/pause" and is_admin: paused = True; send_telegram("⏸ Pauza")
@@ -691,16 +695,22 @@ def is_news_blackout():
 def run():
     global current_trade, last_impulse_ts, last_impulse_info
     try:
-        candles5_raw = fetch_ohlcv("5m")
         candles1_raw = fetch_ohlcv("1m")
+        candles5_raw = fetch_ohlcv("5m")
+        candles15_raw = fetch_ohlcv("15m")
+        candles30_raw = fetch_ohlcv("30m")
     except Exception as e: return
 
-    closed5 = closed_only(candles5_raw)
     closed1 = closed_only(candles1_raw)
+    closed5 = closed_only(candles5_raw)
+    closed15 = closed_only(candles15_raw)
+    closed30 = closed_only(candles30_raw)
     price = candles1_raw[-1][C] + PRICE_OFFSET
 
-    bias5 = confirmed_structure_bias(closed5)
     bias1 = confirmed_structure_bias(closed1)
+    bias5 = confirmed_structure_bias(closed5)
+    bias15 = confirmed_structure_bias(closed15)
+    bias30 = confirmed_structure_bias(closed30)
     atr5 = calculate_atr(closed5)
 
     bias1h, bias4h, bias1d = None, None, None
@@ -713,10 +723,11 @@ def run():
 
     last_status.update({
         "price": price, "bias1": bias1, "bias5": bias5,
+        "bias15": bias15, "bias30": bias30,
         "bias1h": bias1h, "bias4h": bias4h, "bias1d": bias1d,
         "checked_at": time.strftime("%H:%M:%S"),
     })
-    save_status(round(price, 2), bias1, bias5, bias1h, bias4h, bias1d)
+    save_status(round(price, 2), bias1, bias5, bias15, bias30, bias1h, bias4h, bias1d)
 
     with state_lock: PRICE_HISTORY.append(round(price, 2))
 
@@ -730,7 +741,7 @@ def run():
     with state_lock:
         if current_trade:
             monitor_open_trade(price, bias5)
-            save_status(round(price, 2), bias1, bias5, bias1h, bias4h, bias1d)
+            save_status(round(price, 2), bias1, bias5, bias15, bias30, bias1h, bias4h, bias1d)
             return
 
         update_post_trade(price)
@@ -738,7 +749,11 @@ def run():
 
         blackout, event_title = is_news_blackout()
         if blackout: return
-        if bias1 is None or bias5 is None or bias1 != bias5: return
+        
+        # BAROVAR 1/5/15/30m tekshiruvi (faqat hammasi bir xil bo'lsa)
+        if None in (bias1, bias5, bias15, bias30) or not (bias1 == bias5 == bias15 == bias30): 
+            return
+            
         if HTF_FILTER_ENABLED and bias1h is not None and bias1h != bias5: return
         if STRONG_HTF_FILTER_ENABLED and bias4h is not None and bias4h != bias5: return
         if DAILY_HTF_FILTER_ENABLED and bias1d is not None and bias1d != bias5: return
@@ -779,7 +794,7 @@ def run():
 
     message = (
         f"GOLD SCALP - {trade['signal']}\n"
-        f"1m/5m bias: {bias5} | 1h: {bias1h or 'n/a'}\n"
+        f"1/5/15/30m bias: {bias5} | 1h: {bias1h or 'n/a'}\n"
         f"Narx: {round(price, 2)}\n"
         f"Entry: {trade['entry']}\n"
         f"SL: {trade['sl']}\n"
@@ -791,7 +806,7 @@ def run():
     send_telegram(message)
     with state_lock:
         current_trade = trade
-        save_status(round(price, 2), bias1, bias5, bias1h, bias4h, bias1d)
+        save_status(round(price, 2), bias1, bias5, bias15, bias30, bias1h, bias4h, bias1d)
 
 
 app = Flask(__name__)
@@ -837,6 +852,8 @@ def home():
     bias_grid = "".join([
         _render_bias_chip("1m", status_snapshot.get("bias1")),
         _render_bias_chip("5m", status_snapshot.get("bias5")),
+        _render_bias_chip("15m", status_snapshot.get("bias15")),
+        _render_bias_chip("30m", status_snapshot.get("bias30")),
         _render_bias_chip("1h", status_snapshot.get("bias1h")),
     ])
 
@@ -852,7 +869,7 @@ def home():
     win_pct = f"{wins / total * 100:.0f}%" if total else "&mdash;"
 
     return f"""<!doctype html><html lang="uz"><head><meta charset="utf-8"><meta http-equiv="refresh" content="5"><meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>1m/5m Scalping</title>
+    <title>1/5/15/30m Scalping</title>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
       :root {{ --bg:#14110D; --surface:#1C1710; --border:#33291C; --text:#EDE3CF; --muted:#8C8271; --gold:#C9A227; }}
@@ -876,7 +893,7 @@ def home():
     </body></html>"""
 
 def loop():
-    logger.info(f"1m/5m Scalping bot ishga tushdi - har {CHECK_INTERVAL_SEC}s tekshiradi")
+    logger.info(f"1/5/15/30m Scalping bot ishga tushdi - har {CHECK_INTERVAL_SEC}s tekshiradi")
     while True:
         try: run()
         except Exception as error: logger.error(f"Xatolik: {error}")
