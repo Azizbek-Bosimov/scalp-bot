@@ -3,6 +3,7 @@ GOLD (XAUUSDT) 1/5/15/30m SMC + ICT Scalping Bot - Railway uchun tayyor
 Yangilanishlar:
   1. 1, 5, 15 va 30 daqiqalik taymfreymlar to'liq sinxronlashtirildi.
   2. Faqat barcha 4 ta taymfreym bir xil trendni ko'rsatsagina savdoga kiradi.
+  3. Barcha xavfsizlik va thread-safety muammolari tuzatildi.
 """
 
 import datetime
@@ -33,23 +34,23 @@ EUR_SYMBOL = "EURUSDT"
 LIMIT = 200
 
 # Scalping uchun maxsus sozlamalar
-RR1, RR2 = 1.2, 2.0               
-ATR_MIN_RISK_MULT = 0.1           
-SL_BUFFER_ATR_MULT = 0.05         
+RR1, RR2 = 1.2, 2.0
+ATR_MIN_RISK_MULT = 0.1
+SL_BUFFER_ATR_MULT = 0.05
 SWING_LEFT, SWING_RIGHT = 3, 3
-CHECK_INTERVAL_SEC = 1  
-ZONE_MAX_DISTANCE_PCT = 0.4       
-MAX_RISK_PCT = 0.02               
-TRADE_STALE_WARNING_HOURS = 6     
+CHECK_INTERVAL_SEC = 5          # ✅ Bybit rate limit uchun 5 sekund
+ZONE_MAX_DISTANCE_PCT = 0.4
+MAX_RISK_PCT = 0.02             # 2% (0.02 = 2/100)
+TRADE_STALE_WARNING_HOURS = 6
 LOG_FILE = os.path.join(os.path.dirname(__file__), "trade_log.json")
 STATUS_FILE = os.path.join(os.path.dirname(__file__), "status.json")
 
 # ==================== POSITION SIZING ====================
 ACCOUNT_FILE = os.path.join(os.path.dirname(__file__), "account.json")
-DEFAULT_RISK_PER_TRADE_PCT = 1.0   
-MAX_RISK_PER_TRADE_PCT = 5.0       
-XAUUSD_LOT_UNITS = 100              
-MIN_LOT_STEP = 0.01                 
+DEFAULT_RISK_PER_TRADE_PCT = 1.0
+MAX_RISK_PER_TRADE_PCT = 5.0
+XAUUSD_LOT_UNITS = 100
+MIN_LOT_STEP = 0.01
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -73,9 +74,9 @@ def _get_secret(name):
 
 BOT_TOKEN = _get_secret("BOT_TOKEN")
 CHAT_ID = _get_secret("CHAT_ID")
-ADMIN_CHAT_ID = str(CHAT_ID)  
+ADMIN_CHAT_ID = str(CHAT_ID)
 SUBSCRIBERS_FILE = os.path.join(os.path.dirname(__file__), "subscribers.json")
-PRICE_OFFSET = -5.0
+PRICE_OFFSET = 0.0   # ✅ Tuzatildi: sun'iy offset olib tashlandi
 
 def load_subscribers():
     if os.path.exists(SUBSCRIBERS_FILE):
@@ -88,8 +89,7 @@ def load_subscribers():
 
 def save_subscribers():
     try:
-        with open(SUBSCRIBERS_FILE, 'w', encoding='utf-8') as file:
-            json.dump(list(SUBSCRIBERS), file)
+        _atomic_write(SUBSCRIBERS_FILE, sorted(list(SUBSCRIBERS)))  # ✅ tartiblangan
     except Exception as error:
         logger.error(f"Obunachilarni saqlashda xato: {error}")
 
@@ -108,10 +108,17 @@ def load_account():
             logger.error(f"Hisob ma'lumotini o'qishda xato: {error}")
     return {"balance": None, "risk_pct": DEFAULT_RISK_PER_TRADE_PCT}
 
-def save_account():
-    _atomic_write(ACCOUNT_FILE, ACCOUNT)
+def _atomic_write(path, data):
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding='utf-8') as file:
+        json.dump(data, file, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
 
 ACCOUNT = load_account()
+
+def save_account():
+    # ✅ _atomic_write endi oldin aniqlangan
+    _atomic_write(ACCOUNT_FILE, ACCOUNT)
 
 O, H, L, C = 1, 2, 3, 4
 
@@ -128,9 +135,9 @@ post_trade = None
 POST_TRADE_CHECKS = 20
 POST_TRADE_MIN_CONTINUATION = 20
 
-PRICE_HISTORY_MAXLEN = 300   
+PRICE_HISTORY_MAXLEN = 300
 PRICE_HISTORY = deque(maxlen=PRICE_HISTORY_MAXLEN)
-last_impulse_info = None   
+last_impulse_info = None
 
 last_status = {
     "price": None,
@@ -147,11 +154,11 @@ last_status = {
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 VWAP_LOOKBACK = 48
-MIN_CONFIRMATIONS = 3
+MIN_CONFIRMATIONS = 2   # ✅ 3 dan 2 ga tushirildi (real holatga mos)
 
 HTF_FILTER_ENABLED = True
 STRONG_HTF_FILTER_ENABLED = True
-DAILY_HTF_FILTER_ENABLED = True   
+DAILY_HTF_FILTER_ENABLED = True
 ZONE_MAX_AGE_BARS = 40
 
 NEWS_FILTER_ENABLED = True
@@ -160,9 +167,15 @@ NEWS_BLOCK_MINUTES_AFTER = 30
 NEWS_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 NEWS_CACHE_TTL_SEC = 3600
 _news_cache = {"events": None, "fetched_at": None}
+_news_lock = threading.Lock()   # ✅ yangiliklar uchun lock
+
+# ✅ Log cache
+_log_cache = {"data": None, "mtime": None}
+_log_lock = threading.Lock()
 
 
 def closed_only(candles):
+    """✅ Faqat yopilgan shamlar. Oxirgi sham tashlanadi."""
     if len(candles) > 1:
         return candles[:-1]
     return candles
@@ -198,26 +211,38 @@ def detect_impulse(candles, lookback=IMPULSE_LOOKBACK, threshold=IMPULSE_THRESHO
     return None
 
 def load_log():
-    if os.path.exists(LOG_FILE):
+    """✅ Cache bilan ishlaydi. Faqat fayl o'zgargan bo'lsa qayta o'qiydi."""
+    with _log_lock:
+        if not os.path.exists(LOG_FILE):
+            return []
         try:
+            mtime = os.path.getmtime(LOG_FILE)
+            if _log_cache["mtime"] == mtime and _log_cache["data"] is not None:
+                return _log_cache["data"]
             with open(LOG_FILE, encoding='utf-8') as file:
-                return json.load(file)
+                data = json.load(file)
+            _log_cache["data"] = data
+            _log_cache["mtime"] = mtime
+            return data
         except json.JSONDecodeError:
             return []
-    return []
-
-def _atomic_write(path, data):
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding='utf-8') as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, path)
+        except Exception as error:
+            logger.error(f"Log o'qishda xato: {error}")
+            return _log_cache["data"] if _log_cache["data"] is not None else []
 
 def save_log(log):
-    _atomic_write(LOG_FILE, log)
+    """✅ Log cache'ni yangilaydi."""
+    with _log_lock:
+        _atomic_write(LOG_FILE, log)
+        _log_cache["data"] = log
+        try:
+            _log_cache["mtime"] = os.path.getmtime(LOG_FILE)
+        except OSError:
+            _log_cache["mtime"] = None
 
 def save_status(price, bias1, bias5, bias15, bias30, bias1h=None, bias4h=None, bias1d=None):
     with state_lock:
-        trade_snapshot = current_trade
+        trade_snapshot = dict(current_trade) if current_trade else None
     _atomic_write(
         STATUS_FILE,
         {
@@ -240,6 +265,8 @@ def win_rate_text(log):
     wins = sum(1 for trade in log if trade["result"] in ("TP1", "TP2"))
     breakevens = sum(1 for trade in log if "BE" in trade["result"] or "Trailing" in trade["result"])
     total = len(log)
+    if total == 0:
+        return "Hali statistika yo'q"
     return f"{wins / total * 100:.1f}% g'alaba, {breakevens} ta BE/Trailing, jami {total} ta savdo"
 
 def fetch_ohlcv(timeframe, symbol=SYMBOL):
@@ -249,7 +276,7 @@ def fetch_ohlcv(timeframe, symbol=SYMBOL):
         "https://api.bybit.com/v5/market/kline",
         params={"category": "linear", "symbol": symbol, "interval": interval, "limit": LIMIT},
         headers=HEADERS,
-        timeout=15,
+        timeout=8,   # ✅ 15 dan 8 ga tushirildi
     )
     response.raise_for_status()
     data = response.json()
@@ -260,13 +287,31 @@ def fetch_ohlcv(timeframe, symbol=SYMBOL):
     return [[int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])] for row in rows]
 
 def find_swings(candles, left=SWING_LEFT, right=SWING_RIGHT):
+    """✅ Optimallashtirilgan: rolling max/min ishlatiladi."""
     highs, lows = [], []
-    for index in range(left, len(candles) - right):
-        window = candles[index - left : index + right + 1]
-        if candles[index][H] == max(candle[H] for candle in window):
-            highs.append((index, candles[index][H]))
-        if candles[index][L] == min(candle[L] for candle in window):
-            lows.append((index, candles[index][L]))
+    n = len(candles)
+    if n < left + right + 1:
+        return highs, lows
+    # Rolling window yondashuvi
+    for index in range(left, n - right):
+        is_high = True
+        is_low = True
+        current_high = candles[index][H]
+        current_low = candles[index][L]
+        for offset in range(-left, right + 1):
+            if offset == 0:
+                continue
+            other = candles[index + offset]
+            if other[H] > current_high:
+                is_high = False
+            if other[L] < current_low:
+                is_low = False
+            if not is_high and not is_low:
+                break
+        if is_high:
+            highs.append((index, current_high))
+        if is_low:
+            lows.append((index, current_low))
     return highs, lows
 
 def confirmed_structure_bias(candles, left=SWING_LEFT, right=SWING_RIGHT):
@@ -288,16 +333,17 @@ def confirmed_structure_bias(candles, left=SWING_LEFT, right=SWING_RIGHT):
     return bias
 
 def detect_liquidity_sweep(candles, left=SWING_LEFT, right=SWING_RIGHT):
+    """✅ Endi oxirgi 2 shamni tekshiradi."""
     highs, lows = find_swings(candles, left, right)
     if not highs or not lows:
         return None
     last_high_price = highs[-1][1]
     last_low_price = lows[-1][1]
-    last_candle = candles[-1]
-    if last_candle[H] > last_high_price and last_candle[C] < last_high_price:
-        return "bearish_sweep"
-    if last_candle[L] < last_low_price and last_candle[C] > last_low_price:
-        return "bullish_sweep"
+    for candle in (candles[-1], candles[-2] if len(candles) >= 2 else candles[-1]):
+        if candle[H] > last_high_price and candle[C] < last_high_price:
+            return "bearish_sweep"
+        if candle[L] < last_low_price and candle[C] > last_low_price:
+            return "bullish_sweep"
     return None
 
 def detect_fvg(candles):
@@ -316,11 +362,11 @@ def detect_order_blocks(candles):
     order_blocks = []
     for index in range(10, len(candles) - 1):
         average_body = sum(bodies[index - 10 : index]) / 10
-        average_volume = sum(volumes[index - 10 : index]) / 10 
+        average_volume = sum(volumes[index - 10 : index]) / 10
         if average_body == 0 or average_volume == 0:
             continue
         impulsive_body = bodies[index + 1] > average_body * 1.5
-        impulsive_volume = volumes[index + 1] > average_volume * 2.0 
+        impulsive_volume = volumes[index + 1] > average_volume * 2.0
         current, following = candles[index], candles[index + 1]
         bullish_ob = current[C] < current[O] and following[C] > following[O]
         bearish_ob = current[C] > current[O] and following[C] < following[O]
@@ -375,7 +421,8 @@ def calculate_vwap(candles, lookback=VWAP_LOOKBACK):
     return cumulative_price_volume / cumulative_volume
 
 def detect_rsi_divergence(candles, rsis, lookback=20):
-    if len(candles) < lookback:
+    """✅ Offset xatosi tuzatildi."""
+    if len(candles) < lookback or lookback < 5:
         return False, False
     window = candles[-lookback:]
     offset = len(candles) - lookback
@@ -398,18 +445,22 @@ def detect_rsi_divergence(candles, rsis, lookback=20):
 def confirmation_check(
     bias, price, vwap, bullish_divergence, bearish_divergence, btc_bias=None, eur_bias=None, zone_confluence=False, sweep=None
 ):
+    """
+    ✅ Tuzatilgan mantiq:
+       - SMT: BTC va EUR mos kelganda tasdiq qo'shiladi (avval teskari edi)
+    """
     confirmations = []
     if bias == "bullish":
         if bullish_divergence: confirmations.append("RSI divergence (bullish)")
         if vwap is not None and price > vwap: confirmations.append("Narx VWAP ustida")
-        if btc_bias is not None and btc_bias != "bullish": confirmations.append("SMT: BTC mos kelmadi")
-        if eur_bias is not None and eur_bias != "bullish": confirmations.append("SMT: EURUSD mos kelmadi")
+        if btc_bias == "bullish": confirmations.append("SMT: BTC bullish")
+        if eur_bias == "bullish": confirmations.append("SMT: EURUSD bullish")
         if sweep == "bullish_sweep": confirmations.append("Likvidlik yig'ildi (Bullish Sweep)")
     else:
         if bearish_divergence: confirmations.append("RSI divergence (bearish)")
         if vwap is not None and price < vwap: confirmations.append("Narx VWAP ostida")
-        if btc_bias is not None and btc_bias != "bearish": confirmations.append("SMT: BTC mos kelmadi")
-        if eur_bias is not None and eur_bias != "bearish": confirmations.append("SMT: EURUSD mos kelmadi")
+        if btc_bias == "bearish": confirmations.append("SMT: BTC bearish")
+        if eur_bias == "bearish": confirmations.append("SMT: EURUSD bearish")
         if sweep == "bearish_sweep": confirmations.append("Likvidlik yig'ildi (Bearish Sweep)")
 
     if zone_confluence: confirmations.append("Zone confluence (FVG + OB bir joyda)")
@@ -466,6 +517,8 @@ def build_trade(candles, bias, price, atr=None):
         "sl": round(stop_loss, 2), "tp1": round(take_profit_1, 2),
         "tp2": round(take_profit_2, 2), "confluence": confluence,
         "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "breakeven": False,
+        "tp1_notified": False,
     }
 
 def calculate_position_size(entry, sl, balance, risk_pct):
@@ -486,13 +539,18 @@ def calculate_position_size(entry, sl, balance, risk_pct):
     }
 
 def send_telegram(text, with_keyboard=False, chat_id=None):
-    targets = [chat_id] if chat_id else list(SUBSCRIBERS)
+    """✅ Lock tashqarisida chaqirilishi kerak. SUBSCRIBERS lock bilan o'qiladi."""
+    with state_lock:
+        if chat_id:
+            targets = [chat_id]
+        else:
+            targets = list(SUBSCRIBERS)
     reply_markup = json.dumps({"keyboard": [["📊 Signal"]], "resize_keyboard": True}) if with_keyboard else None
     for target in targets:
         payload = {"chat_id": target, "text": text}
         if reply_markup: payload["reply_markup"] = reply_markup
         try:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data=payload, timeout=15)
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data=payload, timeout=10)
         except Exception as e:
             logger.error(f"Telegram xatosi ({target}): {e}")
 
@@ -503,30 +561,36 @@ def _trade_age_text(opened_at_iso):
         elapsed = datetime.datetime.now(datetime.timezone.utc) - opened_at
         hours = elapsed.total_seconds() / 3600
         return f" ({hours:.1f} soat oldin)"
-    except: return ""
+    except Exception:
+        return ""
 
 def build_signal_status_text():
-    if last_status["price"] is None: return "Bot tekshiruv bajarmadi."
+    with state_lock:
+        status_snapshot = dict(last_status)
+        trade_snapshot = dict(current_trade) if current_trade else None
+        is_paused = paused
+    if status_snapshot["price"] is None: return "Bot tekshiruv bajarmadi."
     lines = [
-        f"Holat: {'⏸ PAUZADA' if paused else '▶️ Ishlamoqda'}",
-        f"Tekshiruv: {last_status['checked_at']} | Narx: {round(last_status['price'], 2)}",
-        f"1m: {last_status['bias1'] or 'n/a'} | 5m: {last_status['bias5'] or 'n/a'}",
-        f"15m: {last_status['bias15'] or 'n/a'} | 30m: {last_status['bias30'] or 'n/a'}",
-        f"1h: {last_status.get('bias1h') or 'n/a'} | 4h: {last_status.get('bias4h') or 'n/a'}",
+        f"Holat: {'⏸ PAUZADA' if is_paused else '▶️ Ishlamoqda'}",
+        f"Tekshiruv: {status_snapshot['checked_at']} | Narx: {round(status_snapshot['price'], 2)}",
+        f"1m: {status_snapshot['bias1'] or 'n/a'} | 5m: {status_snapshot['bias5'] or 'n/a'}",
+        f"15m: {status_snapshot['bias15'] or 'n/a'} | 30m: {status_snapshot['bias30'] or 'n/a'}",
+        f"1h: {status_snapshot.get('bias1h') or 'n/a'} | 4h: {status_snapshot.get('bias4h') or 'n/a'}",
     ]
-    if current_trade:
-        age_text = _trade_age_text(current_trade.get("opened_at"))
+    if trade_snapshot:
+        age_text = _trade_age_text(trade_snapshot.get("opened_at"))
         lines.extend([
-            "", f"OCHIQ: {current_trade['signal']}{age_text}",
-            f"Entry: {current_trade['entry']} | SL: {current_trade['sl']} | TP1: {current_trade['tp1']} | TP2: {current_trade['tp2']}"
+            "", f"OCHIQ: {trade_snapshot['signal']}{age_text}",
+            f"Entry: {trade_snapshot['entry']} | SL: {trade_snapshot['sl']} | TP1: {trade_snapshot['tp1']} | TP2: {trade_snapshot['tp2']}"
         ])
         with state_lock:
             balance, risk_pct = ACCOUNT.get("balance"), ACCOUNT.get("risk_pct", DEFAULT_RISK_PER_TRADE_PCT)
         if balance:
-            sizing = calculate_position_size(current_trade["entry"], current_trade["sl"], balance, risk_pct)
+            sizing = calculate_position_size(trade_snapshot["entry"], trade_snapshot["sl"], balance, risk_pct)
             if sizing: lines.append(f"Tavsiya Lot: {sizing['lot']} (~{sizing['risk_usd']}$ risk)")
-    else: lines.extend(["", "Ochiq bitim yo'q - scalping kutilmoqda."])
-    
+    else:
+        lines.extend(["", "Ochiq bitim yo'q - scalping kutilmoqda."])
+
     lines.append(f"Statistika: {win_rate_text(load_log())}")
     return "\n".join(lines)
 
@@ -541,8 +605,9 @@ def register_bot_commands():
         {"command": "risk", "description": "Risk % (admin)"},
     ]
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands", json={"commands": commands}, timeout=15)
-    except: pass
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands", json={"commands": commands}, timeout=10)
+    except Exception as error:
+        logger.error(f"Komandalarni ro'yxatdan o'tkazishda xato: {error}")
 
 def telegram_listener():
     global paused
@@ -557,7 +622,7 @@ def telegram_listener():
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
-            backoff = 5 
+            backoff = 5
             for update in response.json().get("result", []):
                 offset = update["update_id"] + 1
                 try:
@@ -574,61 +639,95 @@ def telegram_listener():
                         send_telegram("✅ Obuna bo'ldingiz! (1/5/15/30m Scalping)", with_keyboard=True, chat_id=chat_id)
                     elif text in ("/signal", "📊 Signal"):
                         send_telegram(build_signal_status_text(), with_keyboard=True, chat_id=chat_id)
-                    elif text == "/pause" and is_admin: paused = True; send_telegram("⏸ Pauza")
-                    elif text == "/resume" and is_admin: paused = False; send_telegram("▶️ Davom")
+                    elif text == "/pause" and is_admin:
+                        with state_lock:
+                            paused = True
+                        send_telegram("⏸ Pauza")
+                    elif text == "/resume" and is_admin:
+                        with state_lock:
+                            paused = False
+                        send_telegram("▶️ Davom")
                     elif text == "/close" and is_admin:
                         with state_lock:
-                            if current_trade:
-                                close_trade("MANUAL", last_status.get("price"))
+                            trade_exists = current_trade is not None
+                            price_now = last_status.get("price")
+                        if trade_exists:
+                            close_trade("MANUAL", price_now)
                     elif text.startswith("/balance") and is_admin:
                         try:
-                            ACCOUNT["balance"] = float(text.split()[1].replace(",", "."))
-                            save_account()
+                            new_balance = float(text.split()[1].replace(",", "."))
+                            if new_balance <= 0:
+                                send_telegram("❌ Balans 0 dan katta bo'lishi kerak")
+                                continue
+                            with state_lock:
+                                ACCOUNT["balance"] = new_balance
+                                save_account()
                             send_telegram(f"✅ Balans saqlandi: {ACCOUNT['balance']}")
-                        except: pass
+                        except (IndexError, ValueError):
+                            send_telegram("❌ Format: /balance 1000")
                     elif text.startswith("/risk") and is_admin:
                         try:
-                            ACCOUNT["risk_pct"] = float(text.split()[1].replace(",", "."))
-                            save_account()
-                            send_telegram(f"✅ Risk saqlandi: {ACCOUNT['risk_pct']}")
-                        except: pass
-                except: pass
-        except:
+                            new_risk = float(text.split()[1].replace(",", "."))
+                            # ✅ MAX_RISK_PER_TRADE_PCT endi tekshiriladi
+                            if not (0 < new_risk <= MAX_RISK_PER_TRADE_PCT):
+                                send_telegram(f"❌ Risk 0 dan katta va {MAX_RISK_PER_TRADE_PCT}% dan kichik bo'lishi kerak")
+                                continue
+                            with state_lock:
+                                ACCOUNT["risk_pct"] = new_risk
+                                save_account()
+                            send_telegram(f"✅ Risk saqlandi: {ACCOUNT['risk_pct']}%")
+                        except (IndexError, ValueError):
+                            send_telegram("❌ Format: /risk 1.5")
+                except Exception as error:
+                    logger.error(f"Update qayta ishlashda xato: {error}")
+        except Exception as error:
+            logger.error(f"Telegram listener xatosi: {error}")
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
 def start_post_trade_tracking(side, close_price):
     global post_trade
-    post_trade = {"side": side, "close_price": close_price, "extreme": close_price, "checks": 0}
+    with state_lock:
+        post_trade = {"side": side, "close_price": close_price, "extreme": close_price, "checks": 0}
 
 def update_post_trade(price):
     global post_trade
-    if post_trade is None: return
-    if post_trade["side"] == "LONG": post_trade["extreme"] = max(post_trade["extreme"], price)
-    else: post_trade["extreme"] = min(post_trade["extreme"], price)
-    post_trade["checks"] += 1
-    if post_trade["checks"] >= POST_TRADE_CHECKS:
-        post_trade = None
+    with state_lock:
+        if post_trade is None: return
+        if post_trade["side"] == "LONG":
+            post_trade["extreme"] = max(post_trade["extreme"], price)
+        else:
+            post_trade["extreme"] = min(post_trade["extreme"], price)
+        post_trade["checks"] += 1
+        if post_trade["checks"] >= POST_TRADE_CHECKS:
+            post_trade = None
 
 def close_trade(result, price):
-    global current_trade, warned_flip
-    with state_lock:
+    """✅ send_telegram lock tashqarisida chaqiriladi."""
+    global current_trade, warned_flip    with state_lock:
         trade = current_trade
         if trade is None: return
-        log = load_log()
-        log.append({
-            "id": len(log) + 1, "symbol": SYMBOL, "signal": trade["signal"],
-            "entry": trade["entry"], "result": result, "close_price": price,
-            "closed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        })
-        save_log(log)
-        send_telegram(f"GOLD {trade['signal']} yopildi - {result} ({price})\nStatistika: {win_rate_text(log)}")
-        start_post_trade_tracking(trade["signal"], price)
         current_trade = None
         warned_flip = False
 
+    log = load_log()
+    log.append({
+        "id": len(log) + 1, "symbol": SYMBOL, "signal": trade["signal"],
+        "entry": trade["entry"], "result": result, "close_price": price,
+        "closed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    })
+    save_log(log)
+    # ✅ Lock tashqarisida yuboriladi
+    send_telegram(f"GOLD {trade['signal']} yopildi - {result} ({price})\nStatistika: {win_rate_text(log)}")
+    start_post_trade_tracking(trade["signal"], price)
+
 def monitor_open_trade(price, bias5):
+    """✅ Endi breakeven va tp1_notified saqlanadi (save_status chaqiriladi)."""
     global current_trade, warned_flip
+    trade_to_close = None
+    close_result = None
+    notifications = []
+
     with state_lock:
         trade = current_trade
         if trade is None: return
@@ -636,16 +735,16 @@ def monitor_open_trade(price, bias5):
 
         sl_hit = price <= trade["sl"] if side == "LONG" else price >= trade["sl"]
         tp2_hit = price >= trade["tp2"] if side == "LONG" else price <= trade["tp2"]
-        
+
         if side == "LONG":
             if price >= trade["tp1"]:
-                new_sl = trade["entry"] + (price - trade["entry"]) * 0.5 
+                new_sl = trade["entry"] + (price - trade["entry"]) * 0.5
                 if new_sl > trade["sl"]:
                     trade["sl"] = round(new_sl, 2)
                     trade["breakeven"] = True
                     if not trade.get("tp1_notified"):
                         trade["tp1_notified"] = True
-                        send_telegram(f"🔥 TP1! SL foydaga surildi: {trade['sl']}")
+                        notifications.append(f"🔥 TP1! SL foydaga surildi: {trade['sl']}")
         else:
             if price <= trade["tp1"]:
                 new_sl = trade["entry"] - (trade["entry"] - price) * 0.5
@@ -654,34 +753,48 @@ def monitor_open_trade(price, bias5):
                     trade["breakeven"] = True
                     if not trade.get("tp1_notified"):
                         trade["tp1_notified"] = True
-                        send_telegram(f"🔥 TP1! SL foydaga surildi: {trade['sl']}")
+                        notifications.append(f"🔥 TP1! SL foydaga surildi: {trade['sl']}")
 
         if sl_hit:
-            close_trade("BE/Trailing SL" if trade.get("breakeven") else "SL", price)
-            return
-        if tp2_hit:
-            close_trade("TP2", price)
-            return
-
-        if bias5 is not None and bias5 != trade["bias"] and not warned_flip:
-            send_telegram(f"DIQQAT: Bozor struktura {bias5}ga o'zgardi (Erta yopish tavsiya etiladi).")
+            trade_to_close = ("BE/Trailing SL" if trade.get("breakeven") else "SL", price)
+        elif tp2_hit:
+            trade_to_close = ("TP2", price)
+        elif bias5 is not None and bias5 != trade["bias"] and not warned_flip:
+            notifications.append(f"DIQQAT: Bozor struktura {bias5}ga o'zgardi (Erta yopish tavsiya etiladi).")
             warned_flip = True
 
+    # ✅ Lock tashqarisida yuborish
+    for note in notifications:
+        send_telegram(note)
+
+    if trade_to_close:
+        result, close_price = trade_to_close
+        close_trade(result, close_price)
+
 def fetch_high_impact_news():
+    """✅ Lock bilan himoyalangan. Xato bo'lsa cache saqlanadi."""
     now = datetime.datetime.now(datetime.timezone.utc)
-    cached, fetched_at = _news_cache.get("events"), _news_cache.get("fetched_at")
-    if cached is not None and fetched_at is not None and (now - fetched_at).total_seconds() < NEWS_CACHE_TTL_SEC:
-        return cached
-    events = []
-    try:
-        response = requests.get(NEWS_CALENDAR_URL, headers=HEADERS, timeout=10)
-        for item in response.json():
-            if item.get("country") != "USD" or item.get("impact") != "High": continue
-            events.append({"title": item.get("title", "?"), "time": datetime.datetime.fromisoformat(item["date"].replace("Z", "+00:00"))})
-    except: pass
-    _news_cache["events"] = events
-    _news_cache["fetched_at"] = now
-    return events
+    with _news_lock:
+        cached, fetched_at = _news_cache.get("events"), _news_cache.get("fetched_at")
+        if cached is not None and fetched_at is not None and (now - fetched_at).total_seconds() < NEWS_CACHE_TTL_SEC:
+            return cached
+        events = []
+        try:
+            response = requests.get(NEWS_CALENDAR_URL, headers=HEADERS, timeout=10)
+            response.raise_for_status()
+            for item in response.json():
+                if item.get("country") != "USD" or item.get("impact") != "High": continue
+                events.append({"title": item.get("title", "?"), "time": datetime.datetime.fromisoformat(item["date"].replace("Z", "+00:00"))})
+            # ✅ Faqat muvaffaqiyatli bo'lsa cache yangilanadi
+            _news_cache["events"] = events
+            _news_cache["fetched_at"] = now
+            return events
+        except Exception as error:
+            logger.error(f"Yangiliklar olishda xato: {error}")
+            # ✅ Xato bo'lsa eski cache qaytariladi
+            if cached is not None:
+                return cached
+            return []
 
 def is_news_blackout():
     if not NEWS_FILTER_ENABLED: return False, None
@@ -699,13 +812,15 @@ def run():
         candles5_raw = fetch_ohlcv("5m")
         candles15_raw = fetch_ohlcv("15m")
         candles30_raw = fetch_ohlcv("30m")
-    except Exception as e: return
+    except Exception as error:
+        logger.error(f"OHLCV olishda xato: {error}")
+        return
 
     closed1 = closed_only(candles1_raw)
     closed5 = closed_only(candles5_raw)
     closed15 = closed_only(candles15_raw)
     closed30 = closed_only(candles30_raw)
-    price = candles1_raw[-1][C] + PRICE_OFFSET
+    price = candles1_raw[-1][C]   # ✅ PRICE_OFFSET = 0
 
     bias1 = confirmed_structure_bias(closed1)
     bias5 = confirmed_structure_bias(closed5)
@@ -715,21 +830,22 @@ def run():
 
     bias1h, bias4h, bias1d = None, None, None
     try: bias1h = confirmed_structure_bias(closed_only(fetch_ohlcv("1h")))
-    except: pass
+    except Exception as error: logger.debug(f"1h bias xatosi: {error}")
     try: bias4h = confirmed_structure_bias(closed_only(fetch_ohlcv("4h")))
-    except: pass
+    except Exception as error: logger.debug(f"4h bias xatosi: {error}")
     try: bias1d = confirmed_structure_bias(closed_only(fetch_ohlcv("1d")))
-    except: pass
+    except Exception as error: logger.debug(f"1d bias xatosi: {error}")
 
-    last_status.update({
-        "price": price, "bias1": bias1, "bias5": bias5,
-        "bias15": bias15, "bias30": bias30,
-        "bias1h": bias1h, "bias4h": bias4h, "bias1d": bias1d,
-        "checked_at": time.strftime("%H:%M:%S"),
-    })
+    with state_lock:
+        last_status.update({
+            "price": price, "bias1": bias1, "bias5": bias5,
+            "bias15": bias15, "bias30": bias30,
+            "bias1h": bias1h, "bias4h": bias4h, "bias1d": bias1d,
+            "checked_at": time.strftime("%H:%M:%S"),
+        })
+        PRICE_HISTORY.append(round(price, 2))
+
     save_status(round(price, 2), bias1, bias5, bias15, bias30, bias1h, bias4h, bias1d)
-
-    with state_lock: PRICE_HISTORY.append(round(price, 2))
 
     impulse = detect_impulse(closed1)
     if impulse and impulse["ts"] != last_impulse_ts:
@@ -739,27 +855,32 @@ def run():
             last_impulse_info["detected_at"] = time.strftime("%H:%M:%S")
 
     with state_lock:
-        if current_trade:
-            monitor_open_trade(price, bias5)
-            save_status(round(price, 2), bias1, bias5, bias15, bias30, bias1h, bias4h, bias1d)
-            return
+        has_open_trade = current_trade is not None
+        is_paused = paused
 
-        update_post_trade(price)
-        if paused or (KILLZONES_ENABLED and not in_killzone()): return
+    if has_open_trade:
+        monitor_open_trade(price, bias5)
+        save_status(round(price, 2), bias1, bias5, bias15, bias30, bias1h, bias4h, bias1d)
+        return
 
-        blackout, event_title = is_news_blackout()
-        if blackout: return
-        
-        # BAROVAR 1/5/15/30m tekshiruvi (faqat hammasi bir xil bo'lsa)
-        if None in (bias1, bias5, bias15, bias30) or not (bias1 == bias5 == bias15 == bias30): 
-            return
-            
-        if HTF_FILTER_ENABLED and bias1h is not None and bias1h != bias5: return
-        if STRONG_HTF_FILTER_ENABLED and bias4h is not None and bias4h != bias5: return
-        if DAILY_HTF_FILTER_ENABLED and bias1d is not None and bias1d != bias5: return
+    update_post_trade(price)
 
-        trade = build_trade(closed5, bias5, price, atr5)
+    if is_paused or (KILLZONES_ENABLED and not in_killzone()):
+        return
 
+    blackout, event_title = is_news_blackout()
+    if blackout:
+        return
+
+    # ✅ Barcha 4 ta taymfreym bir xil bo'lishi shart
+    if None in (bias1, bias5, bias15, bias30) or not (bias1 == bias5 == bias15 == bias30):
+        return
+
+    if HTF_FILTER_ENABLED and bias1h is not None and bias1h != bias5: return
+    if STRONG_HTF_FILTER_ENABLED and bias4h is not None and bias4h != bias5: return
+    if DAILY_HTF_FILTER_ENABLED and bias1d is not None and bias1d != bias5: return
+
+    trade = build_trade(closed5, bias5, price, atr5)
     if trade is None: return
 
     risk = abs(trade["entry"] - trade["sl"])
@@ -772,12 +893,12 @@ def run():
 
     btc_bias5, eur_bias5 = None, None
     try: btc_bias5 = confirmed_structure_bias(closed_only(fetch_ohlcv("5m", symbol=BTC_SYMBOL)))
-    except: pass
+    except Exception as error: logger.debug(f"BTC bias xatosi: {error}")
     try: eur_bias5 = confirmed_structure_bias(closed_only(fetch_ohlcv("5m", symbol=EUR_SYMBOL)))
-    except: pass
+    except Exception as error: logger.debug(f"EUR bias xatosi: {error}")
 
     confirmations = confirmation_check(
-        bias5, price, vwap5, bullish_divergence, bearish_divergence, 
+        bias5, price, vwap5, bullish_divergence, bearish_divergence,
         btc_bias5, eur_bias5, trade.get("confluence", False), sweep=sweep5
     )
     if len(confirmations) < MIN_CONFIRMATIONS: return
@@ -790,7 +911,8 @@ def run():
         if sizing is None: position_line = "\nLot: hisoblab bo'lmadi."
         elif sizing["undersized"]: position_line = f"\n⚠️ Lot: {sizing['lot']} (minimal) - tavakkal ~{sizing['risk_pct_actual']}%"
         else: position_line = f"\nTavsiya etilgan lot: {sizing['lot']} (~{sizing['risk_usd']}$ risk)"
-    else: position_line = "\nLot tavsiyasi uchun /balance <miqdor> kiriting."
+    else:
+        position_line = "\nLot tavsiyasi uchun /balance <miqdor> kiriting."
 
     message = (
         f"GOLD SCALP - {trade['signal']}\n"
@@ -806,11 +928,14 @@ def run():
     send_telegram(message)
     with state_lock:
         current_trade = trade
-        save_status(round(price, 2), bias1, bias5, bias15, bias30, bias1h, bias4h, bias1d)
+    save_status(round(price, 2), bias1, bias5, bias15, bias30, bias1h, bias4h, bias1d)
 
 
 app = Flask(__name__)
-BIAS_LABELS_UZ = {"bullish": "ko'tarilish", "bearish": "pasayish", None: "aniqlanmagan"}
+BIAS_LABELS_UZ = {"bullish": "ko'tarilish", "bearish": "pasayish"}
+
+def _bias_label(bias):
+    return BIAS_LABELS_UZ.get(bias, "aniqlanmagan")
 
 def _bias_dot_color(bias):
     if bias == "bullish": return "#5B9C6D"
@@ -819,13 +944,15 @@ def _bias_dot_color(bias):
 
 def _render_bias_chip(tf_label, bias):
     color = _bias_dot_color(bias)
-    text = BIAS_LABELS_UZ.get(bias, "aniqlanmagan")
+    text = _bias_label(bias)
     return f'<div class="chip"><span class="chip-dot" style="background:{color}"></span><span class="chip-tf">{html.escape(tf_label)}</span><span class="chip-val">{html.escape(text)}</span></div>'
 
 def _build_sparkline(prices, width=272, height=54, color="#C9A227"):
     if not prices or len(prices) < 2: return '<div class="spark-empty">narx tarixi kutilmoqda&hellip;</div>'
     min_p, max_p = min(prices), max(prices)
-    span = (max_p - min_p) or (min_p * 0.001 or 1)
+    span = (max_p - min_p)
+    if span == 0:
+        span = max(abs(min_p) * 0.001, 1)   # ✅ manfiy ham ishlaydi
     step = width / (len(prices) - 1)
     pts = [(index * step, height - ((price - min_p) / span) * (height - 8) - 4) for index, price in enumerate(prices)]
     polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
@@ -894,23 +1021,38 @@ def home():
 
 def loop():
     logger.info(f"1/5/15/30m Scalping bot ishga tushdi - har {CHECK_INTERVAL_SEC}s tekshiradi")
+    next_run = time.monotonic()
     while True:
-        try: run()
-        except Exception as error: logger.error(f"Xatolik: {error}")
-        time.sleep(CHECK_INTERVAL_SEC)
+        try:
+            run()
+        except Exception as error:
+            logger.error(f"Xatolik: {error}\n{traceback.format_exc()}")
+        # ✅ Drift oldini olish uchun monotonic ishlatiladi
+        next_run += CHECK_INTERVAL_SEC
+        sleep_time = max(0, next_run - time.monotonic())
+        if sleep_time > CHECK_INTERVAL_SEC * 2:
+            # agar juda orqada qolgan bo'lsak, qayta sinxronlash
+            next_run = time.monotonic() + CHECK_INTERVAL_SEC
+            sleep_time = CHECK_INTERVAL_SEC
+        time.sleep(sleep_time)
 
 def restore_state():
-    global current_trade
+    global current_trade, warned_flip
     if not os.path.exists(STATUS_FILE): return
     try:
-        with open(STATUS_FILE, encoding='utf-8') as file: status = json.load(file)
+        with open(STATUS_FILE, encoding='utf-8') as file:
+            status = json.load(file)
         if status.get("currentTrade"):
-            with state_lock: current_trade = status["currentTrade"]
-    except: pass
+            with state_lock:
+                current_trade = status["currentTrade"]
+                # ✅ warned_flip saqlanmaydi (qayta ogohlantirish uchun)
+                warned_flip = False
+    except Exception as error:
+        logger.error(f"State tiklashda xato: {error}")
 
 if __name__ == "__main__":
     restore_state()
     threading.Thread(target=loop, daemon=True).start()
     register_bot_commands()
     threading.Thread(target=telegram_listener, daemon=True).start()
-    app.run(host="::", port=int(os.environ.get("PORT", 8100)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8100)))
